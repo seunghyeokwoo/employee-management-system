@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  labels:
+    app: app
+spec:
+  replicas: 1
+  # 컨테이너가 시작 직후 곧 crash 하는 케이스에서 brief Ready 윈도우 만으로
+  # 워크플로우의 rollout polling 이 success 종료되는 false positive 방지.
+  # Pod 가 10s 이상 Ready 유지된 뒤에 availableReplicas 로 카운트된다 (#934 후속).
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      containers:
+        - name: app
+          image: REGISTRY_IMAGE_PLACEHOLDER
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: app-config
+                optional: true
+            - secretRef:
+                name: app-secrets
+                optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
