@@ -1,4 +1,4 @@
-name: Deploy to GCP (Cloud Run)
+name: Deploy to VPS (SSH)
 
 on:
   workflow_dispatch:
@@ -21,61 +21,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Auth to Google Cloud
-        uses: google-github-actions/auth@v2
+      - name: Log in to registry
+        uses: docker/login-action@v3
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-
-      - name: Configure Docker for GCR
-        run: gcloud auth configure-docker --quiet
+          registry: ${{ secrets.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Build and push image
-        env:
-          IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/app:${{ github.sha }}
-        run: |
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
 
-      # 젠빌더 배포 이력(#29036)이 읽는 자리다. stderr 를 파일로 받아 실패 사유를,
-      # 성공하면 서비스 주소를 애너테이션으로 내보낸다. 이 두 줄의 title 로 구분하므로
-      # 고치면 배포 이력의 「실패 사유」·「대상 ›」 이 비어 보인다.
-      - name: Deploy to Cloud Run
+      # ssh-action 은 원격에서 돌아 stderr 를 우리 러너 파일로 받을 수 없다.
+      # 그래서 이 템플릿만 구조화 출력이 없고, 배포 이력은 실패 step 이름으로 폴백한다(#29036).
+      - name: Deploy over SSH
         id: deploy
-        env:
-          REGION: ${{ secrets.GCP_REGION }}
-          IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/app:${{ github.sha }}
-        run: |
-          set -o pipefail
-          gcloud run deploy app \
-            --image "$IMAGE" \
-            --region "$REGION" \
-            --platform managed \
-            --allow-unauthenticated \
-            --format='value(status.url)' 2> >(tee /tmp/genbuilder-deploy.err >&2) | tee /tmp/genbuilder-deploy.out
-
-      - name: Report service URL
-        if: success()
-        run: |
-          # 파일이 없으면 tail 이 비정상 종료해 `-e` 로 스텝이 끝난다 — 성공한 배포가
-          # 실패로 뒤집힌다.
-          URL="$(tail -n 1 /tmp/genbuilder-deploy.out 2>/dev/null | tr -d '\r' || true)"
-          [ -n "$URL" ] && echo "::notice title=GENBUILDER_SERVICE_URL::$URL"
-          exit 0
-
-      - name: Report failure reason
-        if: failure()
-        run: |
-          # Actions 기본 bash 는 `-e -o pipefail` 이다. 파일이 없으면 tail 이 비정상 종료해
-          # 이 줄에서 스텝이 끝나고 아래 애너테이션이 나가지 않는다 — 실패 사유가 통째로 빈다.
-          REASON="$(tail -c 2000 /tmp/genbuilder-deploy.err 2>/dev/null | tr '\n' ' ' || true)"
-          [ -z "$REASON" ] && REASON="배포 단계가 실패했습니다. GitHub 실행 로그를 확인해 주세요."
-          # 오류 코드는 gcloud 가 대문자 스네이크로 뱉는 것만 집는다 — 없으면 비운다.
-          # 대문자 코드가 없는 실패가 더 흔하다. grep 이 1 을 돌려주면 여기서 스텝이 끝나므로
-          # 무매치를 빈 코드로 넘긴다.
-          CODE="$(printf '%s' "$REASON" | grep -oE '[A-Z][A-Z_]{4,}' | head -n 1 || true)"
-          echo "::error title=GENBUILDER_DEPLOY_ERROR ${CODE}::${REASON}"
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/app
+            echo "REGISTRY=${{ secrets.REGISTRY }}" > .env
+            echo "IMAGE_NAME=${{ github.repository }}" >> .env
+            echo "IMAGE_TAG=${{ github.sha }}" >> .env
+            docker login ${{ secrets.REGISTRY }} -u ${{ secrets.REGISTRY_USER }} -p ${{ secrets.REGISTRY_PASSWORD }}
+            docker compose pull
+            docker compose up -d
