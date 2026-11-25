@@ -1,4 +1,4 @@
-name: Deploy to AWS (ECR + ECS)
+name: Deploy to GCP (Cloud Run)
 
 on:
   workflow_dispatch:
@@ -21,67 +21,51 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Auth to Google Cloud
+        uses: google-github-actions/auth@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Login to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Build, tag and push image
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker --quiet
+
+      - name: Build and push image
         env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          REPO: ${{ secrets.AWS_ECR_REPOSITORY }}
-          TAG: ${{ github.sha }}
+          IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/app:${{ github.sha }}
         run: |
-          docker build -t $REGISTRY/$REPO:$TAG .
-          docker push $REGISTRY/$REPO:$TAG
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
 
-      # 서비스가 쓰는 Task Definition 의 이미지만 이번 태그로 바꿔 새 리비전을 등록한다.
-      # --force-new-deployment 만 부르면 ECS 는 기존 리비전을 그대로 다시 띄우므로, 방금 올린
-      # 이미지는 ECR 에 쌓이기만 하고 배포는 성공으로 표시된다 (#21746).
-      - name: Register new task definition with the built image
-        id: taskdef
-        env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          REPO: ${{ secrets.AWS_ECR_REPOSITORY }}
-          TAG: ${{ github.sha }}
-          CLUSTER: ${{ secrets.AWS_ECS_CLUSTER }}
-          SERVICE: ${{ secrets.AWS_ECS_SERVICE }}
-        run: |
-          set -euo pipefail
-          current=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
-            --query 'services[0].taskDefinition' --output text)
-          # 등록에 쓸 수 없는 읽기 전용 필드는 덜어낸다.
-          aws ecs describe-task-definition --task-definition "$current" \
-            --query 'taskDefinition' --output json \
-            | jq --arg image "$REGISTRY/$REPO:$TAG" \
-                '.containerDefinitions[0].image = $image
-                 | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
-                       .compatibilities, .registeredAt, .registeredBy)' > taskdef.json
-          arn=$(aws ecs register-task-definition --cli-input-json file://taskdef.json \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "arn=$arn" >> "$GITHUB_OUTPUT"
-
-      # 젠빌더 배포 이력(#29036)이 읽는 자리다. 아래 두 step 의 title 로 값을 찾으므로
+      # 젠빌더 배포 이력(#29036)이 읽는 자리다. stderr 를 파일로 받아 실패 사유를,
+      # 성공하면 서비스 주소를 애너테이션으로 내보낸다. 이 두 줄의 title 로 구분하므로
       # 고치면 배포 이력의 「실패 사유」·「대상 ›」 이 비어 보인다.
-      - name: Update ECS service
+      - name: Deploy to Cloud Run
         id: deploy
         env:
-          CLUSTER: ${{ secrets.AWS_ECS_CLUSTER }}
-          SERVICE: ${{ secrets.AWS_ECS_SERVICE }}
-          TASKDEF: ${{ steps.taskdef.outputs.arn }}
+          REGION: ${{ secrets.GCP_REGION }}
+          IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/app:${{ github.sha }}
         run: |
           set -o pipefail
-          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
-            --task-definition "$TASKDEF" --force-new-deployment 2> >(tee /tmp/genbuilder-deploy.err >&2) > /dev/null
+          gcloud run deploy app \
+            --image "$IMAGE" \
+            --region "$REGION" \
+            --platform managed \
+            --allow-unauthenticated \
+            --format='value(status.url)' 2> >(tee /tmp/genbuilder-deploy.err >&2) | tee /tmp/genbuilder-deploy.out
 
-      # ECS 는 서비스 주소를 배포 명령이 돌려주지 않는다(로드밸런서에 달린다).
-      # 주소를 알 수 없으면 애너테이션을 내보내지 않고, 이력의 「대상」 은 플랫폼 이름만 보여 준다.
+      - name: Report service URL
+        if: success()
+        run: |
+          # 파일이 없으면 tail 이 비정상 종료해 `-e` 로 스텝이 끝난다 — 성공한 배포가
+          # 실패로 뒤집힌다.
+          URL="$(tail -n 1 /tmp/genbuilder-deploy.out 2>/dev/null | tr -d '\r' || true)"
+          [ -n "$URL" ] && echo "::notice title=GENBUILDER_SERVICE_URL::$URL"
+          exit 0
 
       - name: Report failure reason
         if: failure()
@@ -90,6 +74,7 @@ jobs:
           # 이 줄에서 스텝이 끝나고 아래 애너테이션이 나가지 않는다 — 실패 사유가 통째로 빈다.
           REASON="$(tail -c 2000 /tmp/genbuilder-deploy.err 2>/dev/null | tr '\n' ' ' || true)"
           [ -z "$REASON" ] && REASON="배포 단계가 실패했습니다. GitHub 실행 로그를 확인해 주세요."
+          # 오류 코드는 gcloud 가 대문자 스네이크로 뱉는 것만 집는다 — 없으면 비운다.
           # 대문자 코드가 없는 실패가 더 흔하다. grep 이 1 을 돌려주면 여기서 스텝이 끝나므로
           # 무매치를 빈 코드로 넘긴다.
           CODE="$(printf '%s' "$REASON" | grep -oE '[A-Z][A-Z_]{4,}' | head -n 1 || true)"
