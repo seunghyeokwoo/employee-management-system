@@ -1,0 +1,11 @@
+services:
+  app:
+    image: ${REGISTRY}/${IMAGE_NAME:-app}:${IMAGE_TAG:-latest}
+    container_name: app
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-80}:${APP_PORT:-8000}"
+    env_file:
+      - .env
+    environment:
+      - PORT=${APP_PORT:-8000}
